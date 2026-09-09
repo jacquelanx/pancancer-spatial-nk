@@ -1,0 +1,254 @@
+"""Pan-cancer spatial NK atlas -- Snakemake workflow.
+
+Design rules encoded here, not left to the operator:
+
+* Every stochastic rule takes the global seed from config, so a re-run reproduces.
+* Per-sample work fans out on wildcards; aggregation happens once, at the meta-analysis
+  rule, which is the only place a cross-patient number is produced.
+* Single-cell-resolution and spot-resolution platforms take different paths. NK-resolved
+  spatial testing only runs on the former; spot platforms feed the niche-context path.
+* Resources are declared per rule; deconvolution is the memory-hungry step.
+
+    snakemake -s workflow/Snakefile --use-conda --cores 16 -n     # dry run
+    snakemake -s workflow/Snakefile --use-conda --profile slurm   # cluster
+"""
+
+import json
+from pathlib import Path
+
+configfile: "workflow/config/config.yaml"
+
+RESULTS = Path(config["results_dir"])
+SEED = config["seed"]
+
+SAMPLES = config["samples"]
+SC_PLATFORMS = {"Xenium", "CosMx", "MERFISH", "seqFISH", "STARmap"}
+SINGLE_CELL_SAMPLES = [s for s, m in SAMPLES.items() if m["platform_st"] in SC_PLATFORMS]
+SPOT_SAMPLES = [s for s, m in SAMPLES.items() if m["platform_st"] not in SC_PLATFORMS]
+COHORTS = sorted({m["cancer_type"] for m in SAMPLES.values()})
+ANCHORS = config["anchor_classes"]
+
+
+wildcard_constraints:
+    sample=r"[A-Za-z0-9_.-]+",
+    anchor=r"[A-Za-z0-9_-]+",
+    cohort=r"[A-Za-z0-9_-]+",
+
+
+rule all:
+    input:
+        RESULTS / "manifest" / "geo_candidates.tsv",
+        expand(RESULTS / "integration" / "{cohort}" / "deconvolution_reliability.csv",
+               cohort=COHORTS),
+        expand(RESULTS / "nk" / "{sample}" / "nk_states.h5ad", sample=SINGLE_CELL_SAMPLES),
+        expand(RESULTS / "niche" / "meta" / "NK_vs_{anchor}.json", anchor=ANCHORS),
+        RESULTS / "audit" / "code_audit.md",
+        RESULTS / "report" / "summary.md",
+
+
+# ------------------------------------------------------------------- phase 2: ingest
+
+rule harvest_geo:
+    """Search GEO for candidate datasets. Cached, so this is cheap to re-run."""
+    output:
+        table=RESULTS / "manifest" / "geo_candidates.tsv",
+    params:
+        tumors=",".join(config["tumor_types"]),
+    log:
+        RESULTS / "logs" / "harvest_geo.log",
+    conda:
+        "../env/orchestrator.yaml"
+    resources:
+        mem_mb=4000, runtime=60,
+    shell:
+        r"""
+        python -m panspatial.ingest.harvest \
+            --tumor-types {params.tumors} \
+            --out {output.table} > {log} 2>&1
+        """
+
+
+# -------------------------------------------------- phase 2: integrate + deconvolve
+
+rule integrate_cohort:
+    """Per-cancer-type QC, integration, and deconvolution with a reliability benchmark."""
+    input:
+        sc=lambda wc: config["cohorts"][wc.cohort]["sc_rds"],
+        st=lambda wc: config["cohorts"][wc.cohort]["st_rds"],
+    output:
+        integrated=RESULTS / "integration" / "{cohort}" / "integrated_by_cancer_type.rds",
+        weights=RESULTS / "integration" / "{cohort}" / "rctd_weights_full.rds",
+        reliability=RESULTS / "integration" / "{cohort}" / "deconvolution_reliability.csv",
+        qc=RESULTS / "integration" / "{cohort}" / "qc_thresholds.csv",
+    params:
+        outdir=lambda wc: str(RESULTS / "integration" / wc.cohort),
+        nmads=config["qc"]["nmads"],
+    log:
+        RESULTS / "logs" / "integrate_{cohort}.log",
+    conda:
+        "../env/r-seurat.yaml"
+    threads: 8
+    resources:
+        mem_mb=120000, runtime=720,
+    shell:
+        r"""
+        Rscript R/harmonize_deconvolve.R \
+            --sc-input {input.sc} --st-input {input.st} \
+            --outdir {params.outdir} --nmads {params.nmads} \
+            --max-cores {threads} --seed %d > {log} 2>&1
+        """ % SEED
+
+
+# ------------------------------------------------------------- phase 3: NK profiling
+
+rule extract_nk:
+    """Gate NK cells and emit the ambiguity report that goes into the supplement."""
+    input:
+        adata=lambda wc: SAMPLES[wc.sample]["adata"],
+    output:
+        nk=RESULTS / "nk" / "{sample}" / "nk_cells.h5ad",
+        report=RESULTS / "nk" / "{sample}" / "identity_report.json",
+    log:
+        RESULTS / "logs" / "extract_nk_{sample}.log",
+    conda:
+        "../env/scanpy-spatial.yaml"
+    resources:
+        mem_mb=32000, runtime=120,
+    shell:
+        r"""
+        python -m panspatial.nk.run_extract \
+            --input {input.adata} --out {output.nk} \
+            --report {output.report} --seed %d > {log} 2>&1
+        """ % SEED
+
+
+rule nk_states:
+    """Program-score NK states and measure cluster stability before naming anything."""
+    input:
+        nk=RESULTS / "nk" / "{sample}" / "nk_cells.h5ad",
+    output:
+        states=RESULTS / "nk" / "{sample}" / "nk_states.h5ad",
+        stability=RESULTS / "nk" / "{sample}" / "state_stability.json",
+    log:
+        RESULTS / "logs" / "nk_states_{sample}.log",
+    conda:
+        "../env/scanpy-spatial.yaml"
+    threads: 4
+    resources:
+        mem_mb=32000, runtime=180,
+    shell:
+        r"""
+        python -m panspatial.nk.run_states \
+            --input {input.nk} --out {output.states} \
+            --stability {output.stability} --seed %d > {log} 2>&1
+        """ % SEED
+
+
+rule niche_test:
+    """Torus-shift association test per section. Single-cell platforms only."""
+    input:
+        states=RESULTS / "nk" / "{sample}" / "nk_states.h5ad",
+    output:
+        table=RESULTS / "niche" / "{sample}" / "NK_vs_{anchor}.tsv",
+    params:
+        n_perms=config["spatial"]["n_perms"],
+        min_focal=config["spatial"]["min_nk_per_section"],
+    log:
+        RESULTS / "logs" / "niche_{sample}_{anchor}.log",
+    conda:
+        "../env/scanpy-spatial.yaml"
+    threads: 4
+    resources:
+        mem_mb=16000, runtime=240,
+    shell:
+        r"""
+        python -m panspatial.nk.run_niche \
+            --input {input.states} --anchor {wildcards.anchor} \
+            --n-perms {params.n_perms} --min-focal {params.min_focal} \
+            --out {output.table} --seed %d > {log} 2>&1
+        """ % SEED
+
+
+rule niche_meta:
+    """The one place a cross-patient number is produced.
+
+    Sections are pooled to patients, patients meta-analyzed, and the family-wide BH
+    correction is applied across all anchors and cancer types at once.
+    """
+    input:
+        tables=expand(RESULTS / "niche" / "{sample}" / "NK_vs_{{anchor}}.tsv",
+                      sample=SINGLE_CELL_SAMPLES),
+    output:
+        result=RESULTS / "niche" / "meta" / "NK_vs_{anchor}.json",
+    params:
+        family_size=len(ANCHORS) * len(COHORTS),
+    log:
+        RESULTS / "logs" / "niche_meta_{anchor}.log",
+    conda:
+        "../env/scanpy-spatial.yaml"
+    resources:
+        mem_mb=8000, runtime=30,
+    shell:
+        r"""
+        python -m panspatial.nk.run_meta \
+            --inputs {input.tables} --anchor {wildcards.anchor} \
+            --family-size {params.family_size} \
+            --out {output.result} > {log} 2>&1
+        """
+
+
+# ------------------------------------------------------------------ phase 6: audit
+
+rule code_audit:
+    """LLM audit of the executed pipeline, driven by the versioned phase6.audit prompt."""
+    input:
+        sources=expand("src/panspatial/{module}",
+                       module=["nk/nk_spatial.py", "stats/spatial_stats.py",
+                               "stats/leakage.py", "ingest/geo_sra.py"]),
+    output:
+        report=RESULTS / "audit" / "code_audit.md",
+        bundle=temp(RESULTS / "audit" / "source_bundle.txt"),
+    log:
+        RESULTS / "logs" / "code_audit.log",
+    conda:
+        "../env/orchestrator.yaml"
+    resources:
+        mem_mb=4000, runtime=60,
+    shell:
+        r"""
+        cat {input.sources} > {output.bundle}
+        python -m panspatial.orchestrator.cli run phase6.audit \
+            --var target_paths="{input.sources}" \
+            --var-file source_bundle={output.bundle} \
+            --out {output.report} > {log} 2>&1
+        """
+
+
+rule report:
+    """Assemble the numbers that manuscript prompts are allowed to quote.
+
+    Manuscript templates are gated on --results-verified; this file is what makes that
+    assertion true. Nothing enters a draft that is not in here.
+    """
+    input:
+        meta=expand(RESULTS / "niche" / "meta" / "NK_vs_{anchor}.json", anchor=ANCHORS),
+        reliability=expand(RESULTS / "integration" / "{cohort}" / "deconvolution_reliability.csv",
+                           cohort=COHORTS),
+        stability=expand(RESULTS / "nk" / "{sample}" / "state_stability.json",
+                         sample=SINGLE_CELL_SAMPLES),
+    output:
+        summary=RESULTS / "report" / "summary.md",
+        table=RESULTS / "report" / "verified_results.tsv",
+    log:
+        RESULTS / "logs" / "report.log",
+    conda:
+        "../env/orchestrator.yaml"
+    resources:
+        mem_mb=8000, runtime=30,
+    shell:
+        r"""
+        python -m panspatial.report.build \
+            --meta {input.meta} --reliability {input.reliability} \
+            --stability {input.stability} \
+            --summary {output.summary} --table {output.table} > {log} 2>&1
+        """

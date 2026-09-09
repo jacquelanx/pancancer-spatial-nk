@@ -1,0 +1,13 @@
+name: panspatial-orchestrator
+channels: [conda-forge]
+dependencies:
+  - python=3.11
+  - pandas=2.2.*
+  - numpy=1.26.*
+  - scipy=1.13.*
+  - pyyaml=6.0.*
+  - biopython=1.83
+  - pytest=8.*
+  - pip
+  - pip:
+      - anthropic>=1.0

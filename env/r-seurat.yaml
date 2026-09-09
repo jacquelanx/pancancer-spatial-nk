@@ -1,0 +1,18 @@
+name: panspatial-r
+channels: [conda-forge, bioconda]
+dependencies:
+  # Seurat v5 is required: the layer API in R/harmonize_deconvolve.R does not exist in v4,
+  # and a v4 environment fails at check_versions() rather than silently misbehaving.
+  - r-base=4.3.*
+  - r-seurat=5.1.*
+  - r-seuratobject=5.0.*
+  - r-harmony=1.2.*
+  - r-matrix
+  - r-dplyr
+  - r-optparse
+  - r-devtools
+  - r-remotes
+  # Not on conda; install once into the env:
+  #   remotes::install_github("dmcable/spacexr", ref = <pinned commit>)
+  #   remotes::install_github("chris-mcginnis-ucsf/DoubletFinder", ref = <pinned commit>)
+  # Pin the commit: DoubletFinder renamed paramSweep_v3 -> paramSweep between releases.

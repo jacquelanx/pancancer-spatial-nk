@@ -1,0 +1,50 @@
+# Workflow configuration. Everything stochastic reads `seed` from here.
+seed: 42
+results_dir: results
+
+tumor_types: [LUAD, LUSC, BRCA, CRC, GBM, HNSCC, PDAC, HCC, SKCM, RCC, STAD, OV]
+
+anchor_classes: [malignant, mCAF, iCAF, TLS, vasculature]
+
+qc:
+  # MAD-based, per sample. A flat mitochondrial cut is wrong across tissues.
+  nmads: 3
+  min_features: 200
+  expected_doublet_rate: 0.075
+
+spatial:
+  n_perms: 999
+  # Below this many NK cells, a per-section spatial test is noise. Sections that fall
+  # below it are excluded and counted in the manifest, not silently dropped.
+  min_nk_per_section: 30
+  # Buffer for any spatial ML step, in um. Several times the platform's spot pitch.
+  cv_buffer_um: 200
+  cv_folds: 5
+
+deconvolution:
+  reference_min_cells: 25
+  # Per-cell-type Pearson r against simulated mixtures, below which the type's weights
+  # are treated as similarity scores and barred from carrying a conclusion.
+  reliable_r: 0.7
+  benchmark_spots: 500
+  cells_per_spot: 8
+
+llm:
+  model: claude-opus-5
+  # Manuscript prompts additionally require --results-verified at the CLI.
+  runs_dir: runs
+
+# --- cohort and sample tables -------------------------------------------------------
+# Populated by `panspatial.ingest.harvest` plus manual curation. Two examples of the
+# expected shape; the platform field drives which analysis path a sample takes.
+cohorts: {}
+#  LUAD:
+#    sc_rds: data/LUAD/sc.rds
+#    st_rds: data/LUAD/st.rds
+
+samples: {}
+#  LUAD_P01_S1:
+#    adata: data/LUAD/P01_S1.h5ad
+#    cancer_type: LUAD
+#    patient: LUAD_P01
+#    platform_st: Xenium

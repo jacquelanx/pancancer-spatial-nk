@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+.venv/
+venv/
+.DS_Store
+
+# Data and derived artifacts stay out of git; the manifest and configs define them.
+data/
+results/
+*.h5ad
+*.rds
+*.mtx
+*.loom
+
+# LLM run records: provenance for the manuscript. Keep the ones behind published claims,
+# not every exploratory call.
+runs/*.json
+!runs/.gitkeep
+
+# Claude Code machine-local settings
+.claude/settings.local.json
