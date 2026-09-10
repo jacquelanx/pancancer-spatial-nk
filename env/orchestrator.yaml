@@ -11,3 +11,4 @@ dependencies:
   - pip
   - pip:
       - anthropic>=1.0
+      - openai>=1.40

@@ -169,5 +169,11 @@ never computed, and it survives into a submission.
 3. The system anchor forbids inventing values and requires an `INSUFFICIENT EVIDENCE`
    section when the input cannot support the requested claim.
 
-Every call writes a run record to `runs/` with the prompt fingerprint, the bound inputs, and
-the response, so any sentence in the draft can be traced back to what produced it.
+Every call writes a run record to `runs/` with the prompt fingerprint, the bound inputs, the
+provider, the resolved model or deployment, and the response, so any sentence in the draft
+can be traced back to what produced it.
+
+All three layers sit above the provider backend, so they apply identically on Anthropic and
+Azure OpenAI. Switching providers changes which model wrote the text; it does not change
+what the text is allowed to claim. Record the provider and model in the methods — they are
+in the run record for exactly this reason.

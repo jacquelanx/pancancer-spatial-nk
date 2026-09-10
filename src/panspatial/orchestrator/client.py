@@ -1,13 +1,16 @@
-"""Anthropic client wrapper: cached system anchor, streaming, and a provenance ledger.
+"""Provider-independent execution layer: runs a rendered prompt and records the run.
 
-Design points that matter for a study that has to be defensible:
+Everything that makes this pipeline defensible lives here or above, not in the provider:
 
-* The system anchor (``prompts/system/00_meta.md``) is byte-identical on every call and is
-  the cached prefix, so the statistical constraints are always in force and cheap.
+* The system anchor is byte-identical on every call and sits first in the request, so the
+  statistical constraints are always in force -- and so both providers' prompt caching
+  (explicit on Anthropic, automatic prefix-based on Azure) actually hits.
 * Every call writes a run record under ``runs/`` containing the prompt fingerprint, the
-  bound variable values, token usage, and the response. Any generated sentence can be
+  bound variable values, token usage, and the response, so any generated sentence can be
   traced to the inputs that produced it.
-* Responses are never silently truncated: ``stop_reason == "max_tokens"`` raises.
+* Responses are never silently truncated or silently filtered; the backend raises.
+
+Provider selection is in :mod:`panspatial.orchestrator.backends`.
 """
 
 from __future__ import annotations
@@ -16,27 +19,22 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from panspatial.orchestrator.backends import (
+    Backend,
+    BackendResponse,
+    LLMError,
+    resolve_backend,
+)
 from panspatial.orchestrator.registry import RenderedPrompt
 
 log = logging.getLogger("panspatial.orchestrator")
 
-# USD per million tokens, Claude API list price. Used only for the cost line in run records.
-_PRICING = {
-    "claude-opus-5": (5.0, 25.0),
-    "claude-sonnet-5": (2.0, 10.0),
-    "claude-haiku-4-5": (1.0, 5.0),
-}
-# Above this, the SDK wants streaming or the request risks an HTTP timeout.
-_STREAM_THRESHOLD = 16000
-
-
-class LLMError(RuntimeError):
-    """Raised when a call fails or returns output that must not be used downstream."""
+__all__ = ["LLMError", "LLMResult", "OrchestratorClient"]
 
 
 @dataclass
@@ -44,6 +42,7 @@ class LLMResult:
     fingerprint: str
     template_id: str
     template_version: str
+    provider: str
     model: str
     effort: str
     text: str
@@ -53,77 +52,48 @@ class LLMResult:
     output_tokens: int
     cache_read_tokens: int
     cache_creation_tokens: int
-    cost_usd: float
+    cost_usd: float | None
     duration_s: float
     request_id: str | None
     created_at: str
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @property
+    def cost_display(self) -> str:
+        """Cost is only shown where list pricing is actually known.
 
-def _estimate_cost(model: str, usage: Any) -> float:
-    price_in, price_out = _PRICING.get(model, (0.0, 0.0))
-    fresh = getattr(usage, "input_tokens", 0) or 0
-    cached_read = getattr(usage, "cache_read_input_tokens", 0) or 0
-    cached_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
-    out = getattr(usage, "output_tokens", 0) or 0
-    # Cache reads bill at ~0.1x, cache writes at ~1.25x of the input rate.
-    return (
-        fresh * price_in
-        + cached_read * price_in * 0.1
-        + cached_write * price_in * 1.25
-        + out * price_out
-    ) / 1_000_000
+        Azure pricing depends on region, tier, and commercial agreement, so the run record
+        reports tokens and says so rather than printing a number that is probably wrong.
+        """
+        return f"${self.cost_usd:.4f}" if self.cost_usd is not None else "unpriced"
 
 
 class OrchestratorClient:
-    """Executes a :class:`RenderedPrompt` against the Claude API and records the run."""
+    """Executes a :class:`RenderedPrompt` against a backend and records the run."""
 
     def __init__(
         self,
         run_dir: str | Path = "runs",
         *,
-        client: Any | None = None,
+        backend: Backend | str | None = None,
         dry_run: bool = False,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.dry_run = dry_run
-        self._client = client
-        if client is None and not dry_run:
-            try:
-                import anthropic
-            except ImportError as exc:  # pragma: no cover - environment dependent
-                raise LLMError(
-                    "the `anthropic` package is required for live calls; "
-                    "`pip install anthropic`, or use dry_run=True to render prompts only"
-                ) from exc
-            # Zero-arg construction resolves ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN,
-            # or an `ant auth login` profile, in that order.
-            self._client = anthropic.Anthropic(timeout=1800.0, max_retries=4)
+        if dry_run:
+            self.backend: Backend | None = backend if isinstance(backend, Backend) else None
+        elif isinstance(backend, Backend):
+            self.backend = backend
+        else:
+            self.backend = resolve_backend(backend)
+        if self.backend is not None and not dry_run:
+            log.info("backend: %s", self.backend.describe())
 
     # ------------------------------------------------------------------ requests
-
-    def _request_kwargs(self, prompt: RenderedPrompt, schema: dict | None) -> dict[str, Any]:
-        output_config: dict[str, Any] = {"effort": prompt.effort}
-        if schema is not None:
-            output_config["format"] = {"type": "json_schema", "schema": schema}
-        return {
-            "model": prompt.model,
-            "max_tokens": prompt.max_tokens,
-            # Frozen prefix -> cached. Never interpolate anything per-run into `system`.
-            "system": [
-                {
-                    "type": "text",
-                    "text": prompt.system,
-                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
-                }
-            ],
-            "messages": [{"role": "user", "content": prompt.user}],
-            "thinking": {"type": "adaptive"},
-            "output_config": output_config,
-        }
 
     def run(
         self,
@@ -134,106 +104,80 @@ class OrchestratorClient:
     ) -> LLMResult:
         if self.dry_run:
             return self._dry_run_result(prompt)
+        assert self.backend is not None
 
-        kwargs = self._request_kwargs(prompt, schema)
-        started = time.monotonic()
+        target = self.backend.resolve_model(prompt.model)
         log.info(
-            "calling %s [%s v%s, effort=%s, fp=%s]",
-            prompt.model,
+            "calling %s [%s v%s, model=%s, effort=%s, fp=%s]",
+            self.backend.name,
             prompt.template_id,
             prompt.template_version,
+            target,
             prompt.effort,
             prompt.fingerprint,
         )
-        response = self._call(kwargs)
+        started = time.monotonic()
+        response = self.backend.complete(prompt, schema=schema)
         duration = time.monotonic() - started
 
-        if response.stop_reason == "refusal":
-            details = getattr(response, "stop_details", None)
-            raise LLMError(
-                f"{prompt.template_id}: request declined "
-                f"({getattr(details, 'category', 'unknown')}): "
-                f"{getattr(details, 'explanation', '')}"
-            )
-        if response.stop_reason == "max_tokens":
-            raise LLMError(
-                f"{prompt.template_id}: response hit max_tokens ({prompt.max_tokens}) and is "
-                "truncated. Raise max_tokens in the template rather than using partial output."
-            )
-
-        text = "".join(b.text for b in response.content if b.type == "text")
-        parsed = None
-        if schema is not None:
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError as exc:
-                raise LLMError(f"{prompt.template_id}: structured output is not valid JSON") from exc
-
-        usage = response.usage
-        result = LLMResult(
-            fingerprint=prompt.fingerprint,
-            template_id=prompt.template_id,
-            template_version=prompt.template_version,
-            model=prompt.model,
-            effort=prompt.effort,
-            text=text,
-            parsed=parsed,
-            stop_reason=response.stop_reason,
-            input_tokens=getattr(usage, "input_tokens", 0) or 0,
-            output_tokens=getattr(usage, "output_tokens", 0) or 0,
-            cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
-            cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
-            cost_usd=_estimate_cost(prompt.model, usage),
-            duration_s=round(duration, 2),
-            request_id=getattr(response, "_request_id", None),
-            created_at=datetime.now(timezone.utc).isoformat(),
-        )
+        result = self._to_result(prompt, response, duration)
         log.info(
-            "done fp=%s in %.1fs, %d out tok, cache_read=%d, $%.4f",
+            "done fp=%s in %.1fs, %d out tok, cached_in=%d, %s",
             result.fingerprint,
             result.duration_s,
             result.output_tokens,
             result.cache_read_tokens,
-            result.cost_usd,
+            result.cost_display,
         )
         if result.cache_read_tokens == 0 and result.cache_creation_tokens == 0:
             log.warning(
                 "no cache activity on fp=%s -- the system anchor should be a cached prefix; "
-                "check that nothing per-run leaked into `system`",
+                "check that nothing per-run leaked into the system message",
                 result.fingerprint,
             )
         if write_record:
             self._write_record(prompt, result)
         return result
 
-    def _call(self, kwargs: dict[str, Any]) -> Any:
-        import anthropic
-
-        try:
-            if kwargs["max_tokens"] > _STREAM_THRESHOLD:
-                with self._client.messages.stream(**kwargs) as stream:
-                    return stream.get_final_message()
-            return self._client.messages.create(**kwargs)
-        except anthropic.NotFoundError as exc:
-            raise LLMError(f"unknown model {kwargs['model']!r}: {exc}") from exc
-        except anthropic.AuthenticationError as exc:
-            raise LLMError(
-                "authentication failed: set ANTHROPIC_API_KEY or run `ant auth login`"
-            ) from exc
-        except anthropic.RateLimitError as exc:
-            raise LLMError(f"rate limited after SDK retries: {exc}") from exc
-        except anthropic.BadRequestError as exc:
-            raise LLMError(f"request rejected: {exc}") from exc
-        except anthropic.APIConnectionError as exc:
-            raise LLMError(f"network failure reaching the API: {exc}") from exc
-
-    def _dry_run_result(self, prompt: RenderedPrompt) -> LLMResult:
-        log.info("dry run: %s fp=%s (%d chars)", prompt.template_id, prompt.fingerprint, len(prompt.user))
+    def _to_result(
+        self, prompt: RenderedPrompt, response: BackendResponse, duration: float
+    ) -> LLMResult:
         return LLMResult(
             fingerprint=prompt.fingerprint,
             template_id=prompt.template_id,
             template_version=prompt.template_version,
-            model=prompt.model,
+            provider=response.provider,
+            model=response.model,
+            effort=prompt.effort,
+            text=response.text,
+            parsed=response.parsed,
+            stop_reason=response.stop_reason,
+            input_tokens=response.input_tokens,
+            output_tokens=response.output_tokens,
+            cache_read_tokens=response.cached_input_tokens,
+            cache_creation_tokens=response.cache_write_tokens,
+            cost_usd=response.cost_usd,
+            duration_s=round(duration, 2),
+            request_id=response.request_id,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            extra=dict(response.extra),
+        )
+
+    def _dry_run_result(self, prompt: RenderedPrompt) -> LLMResult:
+        target = self.backend.resolve_model(prompt.model) if self.backend else prompt.model
+        log.info(
+            "dry run: %s fp=%s -> %s (%d chars)",
+            prompt.template_id,
+            prompt.fingerprint,
+            target,
+            len(prompt.user),
+        )
+        return LLMResult(
+            fingerprint=prompt.fingerprint,
+            template_id=prompt.template_id,
+            template_version=prompt.template_version,
+            provider=self.backend.name if self.backend else "dry-run",
+            model=target,
             effort=prompt.effort,
             text="",
             parsed=None,
@@ -259,11 +203,12 @@ class OrchestratorClient:
                 "id": prompt.template_id,
                 "version": prompt.template_version,
                 "fingerprint": prompt.fingerprint,
-                "model": prompt.model,
+                "requested_model": prompt.model,
+                "resolved_model": result.model,
+                "provider": result.provider,
                 "effort": prompt.effort,
                 "bound_values": prompt.bound_values,
                 "user_prompt": prompt.user,
-                "system_sha256_prefix": prompt.fingerprint,
             },
             "result": result.to_dict(),
             "env": {

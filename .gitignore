@@ -21,3 +21,8 @@ runs/*.json
 
 # Claude Code machine-local settings
 .claude/settings.local.json
+
+# Provider credentials
+.env
+.env.local
+!.env.example

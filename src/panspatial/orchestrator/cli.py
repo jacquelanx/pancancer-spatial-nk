@@ -4,12 +4,18 @@
     python -m panspatial.orchestrator.cli show phase3.nk_spatial
     python -m panspatial.orchestrator.cli run phase3.nk_spatial \
         --var adata_path=data/pan_cancer.h5ad --var platform=Xenium --dry-run
+    python -m panspatial.orchestrator.cli run phase4.hypotheses --backend azure ...
     python -m panspatial.orchestrator.cli run phase6.audit \
         --var target_paths=src/panspatial/nk/nk_spatial.py \
         --var-file source_bundle=src/panspatial/nk/nk_spatial.py --out audit.md
 
 ``--var-file`` reads a file into a variable, which is how source bundles and results tables
 get into a prompt without shell quoting hazards.
+
+``--backend`` selects the provider (``anthropic`` or ``azure``). With neither the flag nor
+``PANSPATIAL_BACKEND`` set, Azure is chosen when its variables are present, so a configured
+``.env`` switches providers without touching a prompt template. A ``.env`` at the repository
+root is loaded automatically; real environment variables always win over it.
 """
 
 from __future__ import annotations
@@ -20,7 +26,8 @@ import logging
 import sys
 from pathlib import Path
 
-from panspatial.orchestrator.client import LLMError, OrchestratorClient
+from panspatial.orchestrator.backends import LLMError, load_dotenv, resolve_backend
+from panspatial.orchestrator.client import OrchestratorClient
 from panspatial.orchestrator.registry import PromptError, PromptRegistry
 
 
@@ -46,6 +53,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="panspatial-prompt", description=__doc__)
     parser.add_argument("--prompts", default="prompts", help="prompt root (default: prompts)")
     parser.add_argument("--runs", default="runs", help="run-record directory (default: runs)")
+    parser.add_argument(
+        "--backend",
+        choices=["anthropic", "azure"],
+        help="provider (default: PANSPATIAL_BACKEND, else auto-detected from the environment)",
+    )
+    parser.add_argument(
+        "--env-file", default=".env", help="dotenv file to load (default: .env, if present)"
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -64,6 +79,11 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--out", help="write the response text here")
     p_run.add_argument("--dry-run", action="store_true", help="render only; no API call")
     p_run.add_argument(
+        "--show-target",
+        action="store_true",
+        help="with --dry-run, also resolve the model against the selected backend",
+    )
+    p_run.add_argument(
         "--results-verified",
         action="store_true",
         help="assert that result values came from an executed analysis (required by "
@@ -71,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+    load_dotenv(args.env_file)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
@@ -80,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
         registry = PromptRegistry(args.prompts)
 
         if args.command == "list":
+            print(f"# backend: {_describe_backend(args.backend)}")
             for tid in registry.ids():
                 t = registry.get(tid)
                 gate = " [gated: requires verified results]" if t.requires_verified_results else ""
@@ -111,18 +133,28 @@ def main(argv: list[str] | None = None) -> int:
             if candidate.is_file():
                 schema = json.loads(candidate.read_text())
 
-        client = OrchestratorClient(args.runs, dry_run=args.dry_run)
+        backend = None
+        if not args.dry_run or args.show_target:
+            backend = resolve_backend(args.backend)
+        client = OrchestratorClient(args.runs, backend=backend, dry_run=args.dry_run)
         result = client.run(prompt, schema=schema, write_record=not args.dry_run)
 
         if args.dry_run:
+            target = result.model if backend else f"{prompt.model} (backend not resolved)"
             print(f"--- system anchor ({len(prompt.system)} chars, cached prefix) ---")
-            print(f"--- {prompt.template_id} v{prompt.template_version} fp={prompt.fingerprint} ---")
+            print(
+                f"--- {prompt.template_id} v{prompt.template_version} "
+                f"fp={prompt.fingerprint} -> {target} ---"
+            )
             print(prompt.user)
             return 0
 
         if args.out:
             Path(args.out).write_text(result.text, encoding="utf-8")
-            print(f"wrote {args.out} ({len(result.text)} chars, ${result.cost_usd:.4f})")
+            print(
+                f"wrote {args.out} ({len(result.text)} chars, "
+                f"{result.output_tokens} output tokens, {result.cost_display})"
+            )
         else:
             print(result.text)
         return 0
@@ -130,6 +162,14 @@ def main(argv: list[str] | None = None) -> int:
     except (PromptError, LLMError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+
+def _describe_backend(requested: str | None) -> str:
+    """Best-effort description for `list`; never fatal, since listing needs no provider."""
+    try:
+        return resolve_backend(requested).describe()
+    except LLMError as exc:
+        return f"unavailable ({exc})"
 
 
 if __name__ == "__main__":
