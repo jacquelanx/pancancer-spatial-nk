@@ -12,8 +12,24 @@ Nothing is sent to a model that was not rendered from a template in `prompts/`.
 prompts/          versioned templates; system/00_meta.md is the anchor on every call
 src/panspatial/
   orchestrator/   registry (strict binding, gating, fingerprints), backends, client, CLI
+  modules/        the analysis-module contract, registry and generic runner
   ingest/         GEO/SRA harvesting and platform classification    [phase 2]
-  nk/             NK identity, states, spatial niche testing        [phase 3]
+  qc/             per-sample adaptive QC, coordinate normalisation  [phase 2]
+  integrate/      confounding-aware batch integration               [phase 2]
+  annotate/       cell typing + the foundation-model admission gate [phase 2]
+  deconv/         consensus deconvolution + reliability gate        [phase 4]
+  domains/        platform-aware domain detection + consensus       [phase 4]
+  niches/         niche matching and patient-level recurrence       [phase 4]
+  malignant/      CNV caller selection, cNMF meta-programs          [phase 4]
+  nk/             NK identity, states, spatial niche testing        [phase 4]
+  interactions/   spatially constrained CCI + rank consensus        [phase 5]
+  grn/            regulon niche enrichment and conservation         [phase 5]
+  comodules/      co-expression modules + cross-cohort preservation [phase 5]
+  dynamics/       fate mapping with multi-view corroboration        [phase 5]
+  alignment/      multi-section alignment + residual QC             [phase 5]
+  histology/      H&E expression prediction, flagged as imputation  [phase 5]
+  predict/        outcome models under leakage-safe CV              [phase 6]
+  translate/      signatures, adjusted survival, target ranking     [phase 6]
   stats/          spatial nulls, meta-analysis, CV leakage guards   [cross-cutting]
   report/         the verified-results table that gates drafting    [phase 5]
 R/                Seurat v5 + Harmony + RCTD with a reliability benchmark [phase 2]
@@ -52,6 +68,59 @@ python -m panspatial.orchestrator.cli run phase6.audit \
     --var-file source_bundle=src/panspatial/nk/nk_spatial.py \
     --out results/audit/nk_spatial.md
 ```
+
+## The analysis modules
+
+Sixteen analysis layers, each implementing a common contract
+([modules/base.py](src/panspatial/modules/base.py)). A module cannot produce a result
+without declaring four things, and the framework checks them:
+
+- **Evidence level** — `measured`, `inferred` or `imputed`. `assert_can_validate` refuses a
+  validation whose evidence is weaker than the claim, so histology-predicted expression
+  cannot validate the spatial model it came from.
+- **Replication unit** — anything at cell or spot level is marked as such, so the
+  aggregation layer knows it must pool before a cross-patient claim.
+- **Platform support** — a rare-cell claim on a 55 µm spot is refused at the point of
+  production, not caught in review.
+- **Provenance** — parameters, seed, and external tool versions, hashed into a fingerprint.
+
+```bash
+python -m panspatial.modules.cli list          # every layer, phase, evidence class
+python -m panspatial.modules.cli rules         # the one rule each layer enforces
+python -m panspatial.modules.cli show niches   # detail + dependency availability
+python -m panspatial.modules.cli check         # which optional deps are installed
+```
+
+Any module runs through one generic entrypoint driven by a job file, so adding a layer to
+the workflow adds a job file rather than a rule:
+
+```bash
+python -m panspatial.modules.run --job workflow/jobs/niches/pan_cohort.json
+```
+
+| Layer | Governing rule enforced in code |
+|---|---|
+| `qc` | Thresholds are per sample; every cell lost is recorded |
+| `integrate` | Refuses global correction when batch is confounded with cancer type |
+| `annotate` | Ambiguous and unassigned are real answers, not redistributed |
+| `deconv` | Consensus across methods; disagreement reported, not averaged away |
+| `domains` | Method chosen per platform; disagreement becomes boundary-uncertain |
+| `niches` | Recurrence tested over patients, across cancer types |
+| `malignant` | Caller chosen from allele availability and depth; depth travels with the estimate |
+| `nk_spatial` | Single-cell platforms only; torus-shift null preserves autocorrelation |
+| `interactions` | Sender and receiver must be in contact; co-localisation is not communication |
+| `grn` | Per-patient enrichment pooled by meta-analysis; regulons are hypotheses |
+| `comodules` | Zsummary < 2 means cohort-specific, never pan-cancer |
+| `dynamics` | Two independent method families must agree; velocity alone never suffices |
+| `alignment` | Overlap estimated, not assumed; residual QC gates 3D claims |
+| `histology` | Imputed evidence: extends cohorts, never validates |
+| `predict` | Patient-level folds with a spatial buffer, asserted every fold |
+| `translate` | No target without a falsifier; survival must be stage-adjusted |
+
+Method choices are tied to published benchmarks, including where those benchmarks disagree
+— the deconvolution layer runs four tools because no two benchmarks agree on a single
+winner, and the annotation layer refuses a foundation model that cannot beat scVI, Harmony
+and a plain HVG baseline on held-out patients.
 
 ## Providers
 
@@ -159,11 +228,17 @@ niche-context path.
 
 ## Status
 
-Executed and tested in this repository: the orchestrator (both backends, Azure against a
-fake client covering deployment routing, capability probing, truncation, and content
-filtering), ingest classification, NK spatial layer, and statistics — 123 tests, all
-passing, including simulated-tissue end-to-end runs through meta-analysis and report
-assembly.
+Executed and tested in this repository: the orchestrator (both backends), the module
+contract and all sixteen analysis layers' decision logic, ingest classification, the NK
+spatial layer, and the statistics — **233 tests, all passing**, including simulated-tissue
+runs end to end through meta-analysis, report assembly, and the generic module runner.
+
+What is tested is the logic this repository owns: the gates, the consensus and
+concordance calculations, the reliability and preservation statistics, the recurrence and
+corroboration rules, and the leakage assertions. External heavy tools (cell2location, RCTD,
+GraphST, NicheCompass, pySCENIC, CellRank, PASTE) are called through adapters that are
+import-guarded and unexercised here — install the relevant extra and smoke-test one sample
+before committing a cohort.
 
 Not exercised against a live Azure endpoint — no credentials here. The first real call will
 confirm the deployment mapping and capability probe against your actual deployments; run one

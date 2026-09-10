@@ -3,6 +3,25 @@
 Every item here is enforced somewhere in the code, not left to discipline. The enforcement
 point is named so it can be audited or deliberately overridden with a recorded reason.
 
+Since the analysis layers were added, most of these are enforced by the module contract in
+[`modules/base.py`](../src/panspatial/modules/base.py): a module declares its evidence
+level, replication unit and supported platforms, and cannot emit a result that violates
+them. `python -m panspatial.modules.cli rules` prints the rule each layer enforces.
+
+---
+
+## 0. Evidence has a hierarchy, and it is checked
+
+`measured` > `inferred` > `imputed`. A histology model predicting expression from H&E
+produces `imputed` results; `assert_can_validate` raises if imputed evidence is used to
+validate anything, and if any validation is weaker than the claim it supports.
+
+This closes the circularity the histology-extension slide warns about: a model trained on
+spatial data, used to predict expression on archival slides, cannot then be used to confirm
+the spatial finding it was derived from.
+
+**Enforced by** `panspatial.modules.base.assert_can_validate` and the `Evidence` ordering.
+
 ---
 
 ## 1. NK cells are below the resolution of spot-based platforms

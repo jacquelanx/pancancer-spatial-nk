@@ -31,19 +31,86 @@ ANCHORS = config["anchor_classes"]
 
 wildcard_constraints:
     sample=r"[A-Za-z0-9_.-]+",
+    module=r"[a-z_]+",
+    job=r"[A-Za-z0-9_.-]+",
     anchor=r"[A-Za-z0-9_-]+",
     cohort=r"[A-Za-z0-9_-]+",
+
+
+MODULE_JOBS = Path(config.get("module_jobs_dir", "workflow/jobs"))
+MODULES = config.get("modules", [
+    "qc", "integrate", "annotate", "deconv", "domains", "niches", "malignant",
+    "nk_spatial", "interactions", "grn", "comodules", "dynamics", "alignment",
+    "histology", "predict", "translate",
+])
 
 
 rule all:
     input:
         RESULTS / "manifest" / "geo_candidates.tsv",
+        RESULTS / "modules" / "registry.tsv",
         expand(RESULTS / "integration" / "{cohort}" / "deconvolution_reliability.csv",
                cohort=COHORTS),
         expand(RESULTS / "nk" / "{sample}" / "nk_states.h5ad", sample=SINGLE_CELL_SAMPLES),
         expand(RESULTS / "niche" / "meta" / "NK_vs_{anchor}.json", anchor=ANCHORS),
         RESULTS / "audit" / "code_audit.md",
         RESULTS / "report" / "summary.md",
+
+
+# ------------------------------------------------------------- analysis modules
+
+rule module_registry:
+    """The pipeline's table of contents: every analysis layer and the rule it enforces.
+
+    Emitted as an artifact so a reader of the results can see which layers ran, what
+    evidence class each produces, and what replication unit its n refers to.
+    """
+    output:
+        table=RESULTS / "modules" / "registry.tsv",
+        deps=RESULTS / "modules" / "dependency_report.txt",
+    log:
+        RESULTS / "logs" / "module_registry.log",
+    conda:
+        "../env/orchestrator.yaml"
+    resources:
+        mem_mb=2000, runtime=10,
+    shell:
+        r"""
+        python -c "
+        import sys
+        from panspatial.modules import describe_registry
+        describe_registry().to_csv(sys.argv[1], sep='\t', index=False)
+        " {output.table} > {log} 2>&1
+        python -m panspatial.modules.cli check > {output.deps} 2>> {log}
+        """
+
+
+rule run_module:
+    """Dispatch any registered analysis module through the generic runner.
+
+    One rule covers every layer: the job file names the module, its context (sample,
+    platform, seed, parameters) and its inputs. Adding an analysis layer therefore adds a
+    job file, not a rule.
+    """
+    input:
+        job=MODULE_JOBS / "{module}" / "{job}.json",
+    output:
+        table=RESULTS / "modules" / "{module}" / "{job}.tsv",
+        summary=RESULTS / "modules" / "{module}" / "{job}.summary.json",
+    params:
+        outdir=lambda wc: str(RESULTS / "modules" / wc.module),
+    log:
+        RESULTS / "logs" / "module_{module}_{job}.log",
+    conda:
+        "../env/scanpy-spatial.yaml"
+    threads: 4
+    resources:
+        mem_mb=32000, runtime=240,
+    shell:
+        r"""
+        python -m panspatial.modules.run \
+            --job {input.job} --outdir {params.outdir} > {log} 2>&1
+        """
 
 
 # ------------------------------------------------------------------- phase 2: ingest
@@ -231,6 +298,7 @@ rule report:
     assertion true. Nothing enters a draft that is not in here.
     """
     input:
+        registry=RESULTS / "modules" / "registry.tsv",
         meta=expand(RESULTS / "niche" / "meta" / "NK_vs_{anchor}.json", anchor=ANCHORS),
         reliability=expand(RESULTS / "integration" / "{cohort}" / "deconvolution_reliability.csv",
                            cohort=COHORTS),
