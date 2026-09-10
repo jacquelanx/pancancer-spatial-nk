@@ -26,3 +26,10 @@ runs/*.json
 .env
 .env.local
 !.env.example
+
+# Deck build artifacts (the generator is versioned, the output is not)
+deck/node_modules/
+deck/package*.json
+deck/*.pptx
+deck/*.pdf
+deck/deck.md
